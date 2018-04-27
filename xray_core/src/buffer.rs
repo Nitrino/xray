@@ -49,6 +49,7 @@ pub struct Buffer {
     updates: NotifyCell<()>,
     local_selections: HashMap<SelectionSetId, Weak<RefCell<SelectionSet>>>,
     next_local_selection_set_id: SelectionSetId,
+    updated_local_selections_txs: Vec<unsync::mpsc::UnboundedSender<SelectionSetId>>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Serialize, Hash)]
@@ -57,10 +58,10 @@ pub struct Point {
     pub column: u32,
 }
 
-#[derive(Clone, Eq, PartialEq, Debug, Hash)]
+#[derive(Clone, Eq, PartialEq, Debug, Hash, Serialize, Deserialize)]
 pub struct Anchor(AnchorInner);
 
-#[derive(Clone, Eq, PartialEq, Debug, Hash)]
+#[derive(Clone, Eq, PartialEq, Debug, Hash, Serialize, Deserialize)]
 enum AnchorInner {
     Start,
     End,
@@ -71,12 +72,13 @@ enum AnchorInner {
     },
 }
 
-#[derive(Clone, Eq, PartialEq, Debug, Hash)]
+#[derive(Clone, Eq, PartialEq, Debug, Hash, Serialize, Deserialize)]
 enum AnchorBias {
     Left,
     Right,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Selection {
     pub start: Anchor,
     pub end: Anchor,
@@ -213,8 +215,8 @@ impl Version {
 
 pub mod rpc {
     use super::{Buffer, EditId, FragmentId, Insertion, InsertionSplit, Operation, ReplicaId,
-                Version};
-    use futures::{Async, Future, Stream};
+                Selection, SelectionSetId, Version};
+    use futures::{unsync, Async, Future, Stream};
     use never::Never;
     use rpc;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -230,6 +232,7 @@ pub mod rpc {
         pub(super) insertions: HashMap<EditId, Insertion>,
         pub(super) insertion_splits: HashMap<EditId, Vec<InsertionSplit>>,
         pub(super) version: Version,
+        pub(super) selections: HashMap<ReplicaId, HashMap<SelectionSetId, SelectionSet>>,
     }
 
     #[derive(Serialize, Deserialize)]
@@ -255,9 +258,15 @@ pub mod rpc {
         pub deletions: HashSet<EditId>,
     }
 
+    #[derive(Serialize, Deserialize)]
+    pub(super) struct SelectionSet {
+        selections: Vec<Selection>,
+    }
+
     pub struct Service {
         replica_id: ReplicaId,
         outgoing_ops: Box<Stream<Item = Arc<Operation>, Error = ()>>,
+        local_selections_updates: unsync::mpsc::UnboundedReceiver<SelectionSetId>,
         buffer: Rc<RefCell<Buffer>>,
     }
 
@@ -271,9 +280,11 @@ pub mod rpc {
                 .borrow_mut()
                 .outgoing_ops()
                 .filter(move |op| op.replica_id() != replica_id);
+            let local_selections_updates = buffer.borrow_mut().local_selections_updates();
             Self {
                 replica_id,
                 outgoing_ops: Box::new(outgoing_ops),
+                local_selections_updates,
                 buffer,
             }
         }
@@ -293,6 +304,7 @@ pub mod rpc {
                 insertions: HashMap::new(),
                 insertion_splits: HashMap::new(),
                 version: buffer.version.clone(),
+                selections: HashMap::new(),
             };
 
             for fragment in buffer.fragments.iter() {
@@ -315,6 +327,19 @@ pub mod rpc {
                     .insertion_splits
                     .insert(*insertion_id, splits.iter().cloned().collect());
             }
+
+            let mut local_selections = HashMap::new();
+            for (id, selection_set) in &buffer.local_selections {
+                if let Some(selection_set) = selection_set.upgrade() {
+                    local_selections.insert(
+                        *id,
+                        SelectionSet {
+                            selections: selection_set.borrow().clone(),
+                        },
+                    );
+                }
+            }
+            state.selections.insert(self.replica_id, local_selections);
 
             state
         }
@@ -403,6 +428,7 @@ impl Buffer {
             updates: NotifyCell::new(()),
             local_selections: HashMap::new(),
             next_local_selection_set_id: 0,
+            updated_local_selections_txs: Vec::new(),
         }
     }
 
@@ -449,6 +475,7 @@ impl Buffer {
             updates: NotifyCell::new(()),
             local_selections: HashMap::new(),
             next_local_selection_set_id: 0,
+            updated_local_selections_txs: Vec::new(),
         }.into_shared();
 
         let buffer_clone = buffer.clone();
@@ -545,6 +572,10 @@ impl Buffer {
             buffer: Rc::downgrade(&buffer_rc),
         }));
         buffer.local_selections.insert(id, Rc::downgrade(&set));
+
+        for selection_set_tx in &buffer.updated_local_selections_txs {
+            let _ = selection_set_tx.unbounded_send(id);
+        }
 
         set
     }
@@ -719,6 +750,12 @@ impl Buffer {
     fn outgoing_ops(&mut self) -> unsync::mpsc::UnboundedReceiver<Arc<Operation>> {
         let (tx, rx) = unsync::mpsc::unbounded();
         self.operation_txs.push(tx);
+        rx
+    }
+
+    fn local_selections_updates(&mut self) -> unsync::mpsc::UnboundedReceiver<SelectionSetId> {
+        let (tx, rx) = unsync::mpsc::unbounded();
+        self.updated_local_selections_txs.push(tx);
         rx
     }
 
@@ -1313,6 +1350,16 @@ impl<'a> Iterator for Iter<'a> {
         }
 
         None
+    }
+}
+
+impl SelectionSet {
+    pub fn updated(&self) {
+        if let Some(buffer) = self.buffer.upgrade() {
+            for selection_set_tx in &buffer.borrow().updated_local_selections_txs {
+                let _ = selection_set_tx.unbounded_send(self.id);
+            }
+        }
     }
 }
 
